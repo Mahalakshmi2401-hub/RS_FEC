@@ -1,279 +1,133 @@
 `timescale 1ns/1ps
 
 //=====================================================
-// RS-FEC FSM
+// RS-FEC block scheduler
+// A complete payload is accumulated in the large FIFO.
+// The FSM never uses parity_bytes as the payload length.
 //=====================================================
-
 module rs_fec_fsm
 (
     input  wire       clk,
     input  wire       rst_n,
-
     input  wire       start,
     input  wire       d_plp_tx_valid,
-
+    input  wire       [12:0] fifo_count,
+    input  wire       [7:0]  payload_bytes,
     input  wire       payload_done,
     input  wire       parity_done,
-
-    input  wire       fifo_empty,
-
-    input  wire [4:0] parity_bytes,
-
+    input  wire       block_last,
+    output reg        fec_en,
+    output reg        fec_done,
+    output reg        payload_cnt_en,
     output reg        parity_cnt_en,
-
     output reg        fifo_wr_en,
     output reg        fifo_rd_en,
-
     output reg        parity_clear,
-
     output reg        sel_out,
     output reg        use_fifo
 );
 
-//=====================================================
-// State Definitions
-//=====================================================
-
 localparam IDLE            = 3'd0;
-localparam CLEAR_PARITY    = 3'd1;
-localparam RECEIVE_PAYLOAD = 3'd2;
-localparam OUTPUT_PARITY   = 3'd3;
-localparam PROCESS_FIFO    = 3'd4;
+localparam WAIT_BLOCK      = 3'd1;
+localparam CLEAR_PARITY    = 3'd2;
+localparam PROCESS_PAYLOAD = 3'd3;
+localparam OUTPUT_PARITY   = 3'd4;
+localparam FEC_DONE_STATE  = 3'd5;
 
 reg [2:0] state;
 reg [2:0] next_state;
 
-//=====================================================
-// FIFO Byte Counter
-//=====================================================
-
-reg [4:0] fifo_byte_cnt;
-
-//=====================================================
-// State Register
-//=====================================================
-
-always @(posedge clk or negedge rst_n)
-begin
+always @(posedge clk or negedge rst_n) begin
     if(!rst_n)
         state <= IDLE;
     else
         state <= next_state;
 end
 
-//=====================================================
-// FIFO Byte Counter
-//=====================================================
-
-always @(posedge clk or negedge rst_n)
-begin
-    if(!rst_n)
-    begin
-        fifo_byte_cnt <= 5'd0;
-    end
-    else if(state != PROCESS_FIFO)
-    begin
-        fifo_byte_cnt <= 5'd0;
-    end
-    else if(fifo_rd_en && !fifo_empty)
-    begin
-        fifo_byte_cnt <= fifo_byte_cnt + 5'd1;
-    end
-end
-
-//=====================================================
-// Next-State Logic
-//=====================================================
-
-always @(*)
-begin
-
-    // Default: remain in current state
+always @(*) begin
     next_state = state;
 
     case(state)
-
-        //-------------------------------------------------
-        // IDLE
-        //-------------------------------------------------
-
         IDLE:
-        begin
             if(start)
-                next_state = CLEAR_PARITY;
-        end
+                next_state = WAIT_BLOCK;
 
-        //-------------------------------------------------
-        // Clear parity registers and counters
-        //-------------------------------------------------
+        WAIT_BLOCK:
+            if(fifo_count >= {5'd0,payload_bytes})
+                next_state = CLEAR_PARITY;
 
         CLEAR_PARITY:
-        begin
-            next_state = RECEIVE_PAYLOAD;
-        end
+            next_state = PROCESS_PAYLOAD;
 
-        //-------------------------------------------------
-        // Receive Payload
-        //-------------------------------------------------
-
-        RECEIVE_PAYLOAD:
-        begin
+        PROCESS_PAYLOAD:
             if(payload_done)
                 next_state = OUTPUT_PARITY;
-        end
-
-        //-------------------------------------------------
-        // Output Parity
-        //-------------------------------------------------
 
         OUTPUT_PARITY:
-        begin
-            if(parity_done)
-            begin
-                if(!fifo_empty)
-                    next_state = PROCESS_FIFO;
+            if(parity_done) begin
+                if(block_last)
+                    next_state = FEC_DONE_STATE;
                 else
-                    next_state = CLEAR_PARITY;
+                    next_state = WAIT_BLOCK;
             end
-        end
 
-        //-------------------------------------------------
-        // Process bytes buffered during parity output
-        //-------------------------------------------------
-
-        PROCESS_FIFO:
-        begin
-            if(fifo_empty)
-                next_state = CLEAR_PARITY;
-
-            else if(fifo_byte_cnt == (parity_bytes - 1'b1))
-                next_state = CLEAR_PARITY;
-        end
-
-        //-------------------------------------------------
-        // Safety
-        //-------------------------------------------------
+        FEC_DONE_STATE:
+            next_state = IDLE;
 
         default:
-        begin
             next_state = IDLE;
-        end
-
     endcase
-
 end
 
-//=====================================================
-// Output Logic
-//=====================================================
-
-always @(*)
-begin
-
-    //-------------------------------------------------
-    // Default Outputs
-    //-------------------------------------------------
-
-    parity_cnt_en = 1'b0;
-
-    fifo_wr_en    = 1'b0;
-    fifo_rd_en    = 1'b0;
-
-    parity_clear  = 1'b0;
-
-    sel_out       = 1'b0;
-    use_fifo      = 1'b0;
+always @(*) begin
+    fec_en        = 1'b0;
+    fec_done      = 1'b0;
+    payload_cnt_en = 1'b0;
+    parity_cnt_en  = 1'b0;
+    fifo_wr_en     = 1'b0;
+    fifo_rd_en     = 1'b0;
+    parity_clear   = 1'b0;
+    sel_out        = 1'b0;
+    use_fifo       = 1'b0;
 
     case(state)
-
-        //-------------------------------------------------
-        // IDLE
-        //-------------------------------------------------
-
-        IDLE:
-        begin
-            // Wait for start
+        IDLE: begin
+            fec_en = 1'b0;
         end
 
-        //-------------------------------------------------
-        // Clear Parity
-        //-------------------------------------------------
+        WAIT_BLOCK: begin
+            fec_en    = 1'b1;
+            fifo_wr_en = d_plp_tx_valid;
+        end
 
-        CLEAR_PARITY:
-        begin
-            // Clears:
-            //   - parity registers
-            //   - payload counter
-            //   - parity counter
-
+        CLEAR_PARITY: begin
+            fec_en      = 1'b1;
             parity_clear = 1'b1;
+            fifo_wr_en   = d_plp_tx_valid;
         end
 
-        //-------------------------------------------------
-        // Receive Live Payload
-        //-------------------------------------------------
-
-        RECEIVE_PAYLOAD:
-        begin
-            use_fifo = 1'b0;
-            sel_out  = 1'b0;
+        PROCESS_PAYLOAD: begin
+            fec_en         = 1'b1;
+            use_fifo       = 1'b1;
+            payload_cnt_en = 1'b1;
+            fifo_rd_en     = 1'b1;
+            fifo_wr_en     = d_plp_tx_valid;
         end
 
-        //-------------------------------------------------
-        // Output Parity
-        //-------------------------------------------------
-
-        OUTPUT_PARITY:
-        begin
-
-            // Select parity output
-            sel_out = 1'b1;
-
-            // Enable parity output counter
+        OUTPUT_PARITY: begin
+            fec_en        = 1'b1;
+            sel_out       = 1'b1;
             parity_cnt_en = 1'b1;
-
-            // Store incoming next-frame bytes
-            // while parity is being transmitted
-            if(d_plp_tx_valid)
-                fifo_wr_en = 1'b1;
-
+            fifo_wr_en    = d_plp_tx_valid;
         end
 
-        //-------------------------------------------------
-        // Process FIFO Data
-        //-------------------------------------------------
-
-        PROCESS_FIFO:
-        begin
-
-            // Select FIFO as payload source
-            use_fifo = 1'b1;
-
-            // Payload output selected
-            sel_out = 1'b0;
-
-            // Read FIFO only when data exists
-            if(!fifo_empty)
-                fifo_rd_en = 1'b1;
-
+        FEC_DONE_STATE: begin
+            fec_en   = 1'b0;
+            fec_done = 1'b1;
         end
 
-        //-------------------------------------------------
-        // Safety
-        //-------------------------------------------------
-
-        default:
-        begin
-            parity_cnt_en = 1'b0;
-            fifo_wr_en    = 1'b0;
-            fifo_rd_en    = 1'b0;
-            parity_clear  = 1'b0;
-            sel_out       = 1'b0;
-            use_fifo      = 1'b0;
+        default: begin
         end
-
     endcase
-
 end
-
 endmodule
